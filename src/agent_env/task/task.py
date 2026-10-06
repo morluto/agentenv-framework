@@ -528,13 +528,21 @@ class Task:
         # re-arm after a rollback.
         active_ids = set(state.step_by_id)
         dep_ids: dict[str, set[str]] = {}
+        implicit_dependencies = all(
+            s.depends_on is None for s in steps if s.id in active_ids
+        )
+        previous_active_id: str | None = None
         for i, s in enumerate(steps):
             if s.id not in active_ids:
                 continue
-            if s.depends_on is None:
+            if implicit_dependencies:
+                # Match the scheduler's chain so rollback rearming preserves reachability.
+                dep_ids[s.id] = {previous_active_id} if previous_active_id is not None else set()
+            elif s.depends_on is None:
                 dep_ids[s.id] = {p.id for p in steps[:i] if p.id in active_ids}
             else:
                 dep_ids[s.id] = {d.task_step_id for d in s.depends_on}
+            previous_active_id = s.id
 
         in_flight: dict[str, asyncio.Task] = {}
         task_to_step_id: dict[asyncio.Task, str] = {}
@@ -732,15 +740,21 @@ class Task:
         step_by_id = {s.id: s for s in active_steps}
         dependents: dict[str, list[str]] = {step_id: [] for step_id in step_by_id}
         pending: dict[str, int] = {}
+        implicit_dependencies = all(step.depends_on is None for step in active_steps)
+        previous_step_id: str | None = None
         for i, step in enumerate(active_steps):
-            # When depends_on is None, we assume all prior steps are dependencies.
-            if step.depends_on is None:
+            if implicit_dependencies:
+                # One predecessor has the same reachability as every earlier step here.
+                dependency_step_ids = (previous_step_id,) if previous_step_id is not None else ()
+            elif step.depends_on is None:
+                # When depends_on is None, we assume all prior steps are dependencies.
                 dependency_step_ids = {s.id for s in active_steps[:i]}
             else:
                 dependency_step_ids = {d.task_step_id for d in step.depends_on}
             for dependency_step_id in dependency_step_ids:
                 dependents[dependency_step_id].append(step.id)
             pending[step.id] = len(dependency_step_ids)
+            previous_step_id = step.id
 
         completed: set[str] = set()
         for s in active_steps[:start_step]:
