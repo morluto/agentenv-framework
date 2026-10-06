@@ -64,6 +64,69 @@ def test_threaded_cas_converges(store_coll):
     assert doc["rev"] == n
 
 
+def test_latest_per_id_page_reads_rows_once(store_coll, monkeypatch):
+    store, coll = store_coll
+    for entity_id, version in (("a", 1), ("a", 2), ("b", 1), ("c", 1)):
+        store.insert(coll, {"id": entity_id, "version": version, "created_at_utc": f"{entity_id}{version}"})
+
+    calls = 0
+    original_query = store.query
+
+    def counted_query(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_query(*args, **kwargs)
+
+    monkeypatch.setattr(store, "query", counted_query)
+    page, total = store.latest_per_id_page(
+        coll, Filter(), sort=Sort.by("created_at_utc", descending=False), limit=1, offset=1,
+    )
+    assert [doc["id"] for doc in page] == ["b"]
+    assert total == 3
+    assert calls == 1
+
+
+def test_latest_per_id_page_preserves_backend_override(store_coll, monkeypatch):
+    store, coll = store_coll
+
+    class NativePaginationStore(LocalSqliteDocumentStore):
+        def latest_per_id(self, collection, filter, **kwargs):
+            self.native_page = kwargs
+            return [{"id": "native"}]
+
+    native = NativePaginationStore(str(store.path))
+    monkeypatch.setattr(native, "count_distinct", lambda *args, **kwargs: 17)
+    page, total = native.latest_per_id_page(
+        coll, Filter(), sort=Sort.by("id"), limit=4, offset=8,
+    )
+    assert page == [{"id": "native"}]
+    assert total == 17
+    assert native.native_page["limit"] == 4
+    assert native.native_page["offset"] == 8
+
+    class NativeCountStore(LocalSqliteDocumentStore):
+        def count_distinct(self, collection, filter, *, id_field="id"):
+            self.native_count = (collection, id_field)
+            return 23
+
+    native_count = NativeCountStore(str(store.path))
+    native_count.insert(coll, {"id": "counted", "version": 1})
+    page, total = native_count.latest_per_id_page(coll, Filter(), limit=1)
+    assert len(page) == 1
+    assert total == 23
+    assert native_count.native_count == (coll, "id")
+
+
+def test_latest_per_id_page_zero_limit_keeps_unlimited_semantics(store_coll):
+    store, coll = store_coll
+    for entity_id in ("a", "b", "c"):
+        store.insert(coll, {"id": entity_id, "version": 1})
+
+    page, total = store.latest_per_id_page(coll, Filter(), limit=0, offset=1)
+    assert len(page) == 2
+    assert total == 3
+
+
 def test_reader_sees_a_collection_created_by_another_connection(tmp_path):
     """A long-lived reader must see a collection another connection creates after it opened,
     without reopening. Covers several primitives, not one."""

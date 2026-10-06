@@ -296,6 +296,44 @@ class RoutingDocumentStore(DocumentStore):
             merged = self._latest_across(readers, collection, filter, id_field, version_field)
         return _window(_merge_sort(merged, sort, absent_last=True), limit, offset)
 
+    def latest_per_id_page(
+        self,
+        collection: str,
+        filter: Filter,
+        *,
+        id_field: str = "id",
+        version_field: str = "version",
+        sort: Optional[Sort] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> tuple[list[dict], int]:
+        """Combine latest-per-id pages and totals across the selected sources."""
+        readers = self._readers(collection, filter)
+        if len(readers) == 1:
+            return self._read(
+                readers[0], lambda: readers[0].latest_per_id_page(
+                    collection, filter, id_field=id_field, version_field=version_field,
+                    sort=sort, limit=limit, offset=offset,
+                )
+            )
+        if _ids_split_by_namespace(collection, id_field):
+            window = (offset or 0) + limit if limit else None
+            pages_and_totals = [
+                self._read(store, lambda: store.latest_per_id_page(
+                    collection, filter, id_field=id_field, version_field=version_field,
+                    sort=sort, limit=window, offset=0,
+                ))
+                for store in readers
+            ]
+            docs = [doc for page, _ in pages_and_totals for doc in page]
+            docs = _merge_sort(docs, sort, absent_last=True)
+            total = sum(total for _, total in pages_and_totals)
+        else:
+            docs = self._latest_across(readers, collection, filter, id_field, version_field)
+            docs = _merge_sort(docs, sort, absent_last=True)
+            total = len(docs)
+        return _window(docs, limit, offset), total
+
     def count_distinct(self, collection: str, filter: Filter, *, id_field: str = "id") -> int:
         readers = self._readers(collection, filter)
         if len(readers) == 1 or _ids_split_by_namespace(collection, id_field):
