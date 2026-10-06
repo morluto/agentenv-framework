@@ -313,7 +313,7 @@ class Task:
 
     @classmethod
     def _validate_dag(cls, steps: list[TaskStep]) -> None:
-        ids = {s.id for s in steps}
+        ids = {s.id for s in steps} if any(s.depends_on is not None for s in steps) else set()
         seen: set[str] = set()
         for i, step in enumerate(steps):
             if step.id in seen:
@@ -321,18 +321,14 @@ class Task:
                     f"Duplicate step id '{step.id}' at position {i}; step ids must be unique within a task"
                 )
             seen.add(step.id)
-            prior = {s.id for s in steps[:i]}
             retry_config = getattr(step, "retry_config", None)
-            if retry_config is not None:
+            if retry_config is not None and retry_config.retry_from_step_id != step.id:
                 # Trust the task author's resume point, but catch an obviously
                 # invalid one at creation: it must be the step itself (re-run just
                 # this step) or an earlier dependency ancestor. We do not judge
                 # which spanned steps are replay-safe.
                 ancestors = _ancestor_ids(step.id, _dependency_ids(steps[: i + 1]))
-                if (
-                    retry_config.retry_from_step_id != step.id
-                    and retry_config.retry_from_step_id not in ancestors
-                ):
+                if retry_config.retry_from_step_id not in ancestors:
                     raise ValueError(
                         f"Step '{step.id}' at position {i} declares retry_config.retry_from_step_id "
                         f"'{retry_config.retry_from_step_id}' which is not in the step's dependency "
@@ -340,6 +336,7 @@ class Task:
                     )
             if step.depends_on is None:
                 continue
+            prior = {s.id for s in steps[:i]}
             for dep in step.depends_on:
                 if dep.task_step_id in prior:
                     continue
