@@ -26,6 +26,7 @@ from agent_env.task.store import TaskStepStatus
 logger = logging.getLogger(__name__)
 
 INSTANCE_READ_BATCH_SIZE = 500
+TASK_RUN_PAGE_SIZE = 500
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["runs"])
 
@@ -280,11 +281,11 @@ def _all_task_runs(task_id: str) -> list:
 
     out, offset = [], 0
     while True:
-        page = run_store.list_runs(task_id=task_id, limit=500, offset=offset)
+        page = run_store.list_runs(task_id=task_id, limit=TASK_RUN_PAGE_SIZE, offset=offset)
         out.extend(page)
-        if len(page) < 500:
+        if len(page) < TASK_RUN_PAGE_SIZE:
             return out
-        offset += 500
+        offset += TASK_RUN_PAGE_SIZE
 
 
 def _instances_for_runs(records: list) -> dict[str, dict]:
