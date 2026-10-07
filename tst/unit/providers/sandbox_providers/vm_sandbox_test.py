@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import io
+import logging
 import os
 import subprocess
 import threading
@@ -14,7 +15,8 @@ import pytest
 from agent_env.providers.sandbox_providers import sandbox as sandbox_module
 from agent_env.providers.sandbox_providers.sandbox import VmSandbox
 from agent_env.store import set_object_store
-from agent_env.config import reset_config
+from agent_env.config import get_config, reset_config
+from tst.unit.store.fakes import ConfiguredObjectStore
 from tst.util.exec_scripts import script_run
 
 
@@ -454,11 +456,11 @@ class _CleanupFailingSandbox(VmSandbox):
 
 
 @pytest.mark.asyncio
-async def test_write_file_from_s3_survives_cleanup_blip(signing_store):
+async def test_write_file_from_object_survives_cleanup_blip(signing_store):
     """A transient exec failure on the trailing `rm -f` must not fail the write —
     the file is already delivered into the container."""
     sandbox = _CleanupFailingSandbox()
-    await sandbox.write_file_from_s3("s3://bucket/data.json", "/work/data.json")
+    await sandbox.write_file_from_object("s3://bucket/data.json", "/work/data.json")
     # Delivery happened, and the cleanup was attempted despite the blip.
     assert any("docker cp" in s for s in sandbox.scripts)
     assert any(s.startswith("rm -f") for s in sandbox.scripts)
@@ -481,11 +483,11 @@ async def test_write_file_from_text_survives_cleanup_blip():
 
 
 @pytest.mark.asyncio
-async def test_write_file_from_s3_still_fails_on_delivery_error(signing_store):
+async def test_write_file_from_object_still_fails_on_delivery_error(signing_store):
     """Failures on the actual delivery (docker cp) must still raise."""
     sandbox = _CleanupFailingSandbox(fail_on="docker cp")
     with pytest.raises(RuntimeError):
-        await sandbox.write_file_from_s3("s3://bucket/data.json", "/work/data.json")
+        await sandbox.write_file_from_object("s3://bucket/data.json", "/work/data.json")
 
 
 @pytest.mark.asyncio
@@ -546,7 +548,7 @@ async def test_the_store_is_called_off_the_event_loop(signs):
         sandbox = _PushTargetVmSandbox(b"IMG")
         artifacts = [SimpleNamespace(tar_gz_object_url=f"s3://bucket/{n}.tar.gz", image_name=f"{n}:1") for n in "ab"]
         await sandbox.load_docker_images(artifacts)
-        await sandbox.load_s3_file("s3://bucket/data.json", "/tmp/data.json")
+        await sandbox.load_object_file("s3://bucket/data.json", "/tmp/data.json")
     finally:
         reset_config()
     assert store.on_loop and not any(store.on_loop)
@@ -554,7 +556,7 @@ async def test_the_store_is_called_off_the_event_loop(signs):
 
 _WRITES = {
     "text": lambda sandbox, dest: sandbox.write_file_from_text("body", dest),
-    "object": lambda sandbox, dest: sandbox.write_file_from_s3("s3://bucket/body.json", dest),
+    "object": lambda sandbox, dest: sandbox.write_file_from_object("s3://bucket/body.json", dest),
     "url": lambda sandbox, dest: sandbox.write_file_from_url("https://example.com/body.json", dest),
 }
 
@@ -687,3 +689,39 @@ async def test_docker_cp_passes_its_paths_as_arguments(remove_source, script):
 async def test_a_failed_docker_cp_raises_with_its_stderr():
     with pytest.raises(RuntimeError, match="(?s)exit 1.*no such container"):
         await _ArgsRecorder(exit_code=1).docker_cp("/tmp/a", "c:/x")
+
+
+@pytest.mark.asyncio
+async def test_the_s3_named_methods_are_deprecated_aliases(signing_store, caplog):
+    """They delegate, and each use is counted: the log line, not the warning, is what reaches production logs."""
+    sandbox = _RecordingVmSandbox()
+    with caplog.at_level(logging.WARNING, logger="agent_env.utils.deprecation"):
+        with pytest.warns(DeprecationWarning, match="use load_object_file"):
+            await sandbox.load_s3_file("s3://bucket/a.json", "/tmp/a.json")
+        with pytest.warns(DeprecationWarning, match="use write_file_from_object"):
+            await sandbox.write_file_from_s3("s3://bucket/b.json", "/work/b.json")
+    assert any("https://signed/a.json" in s for s in sandbox.scripts)
+    assert any("https://signed/b.json" in s for s in sandbox.scripts)
+    counted = [r.deprecated_symbol for r in caplog.records if getattr(r, "event", None) == "agent_env_deprecated_symbol"]
+    assert counted == ["VmSandbox.load_s3_file", "Sandbox.write_file_from_s3"]
+
+
+@pytest.mark.asyncio
+async def test_a_url_the_local_store_holds_is_read_from_it_not_the_configured_store(cli_routing, monkeypatch):
+    """Under namespace routing, outside an @local run, the configured store owns only its own urls."""
+    set_object_store(ConfiguredObjectStore())
+    local = get_config().get_object_store_for("@local/~/t")
+    data = local.put("objects/data.json", b"LOCAL-DATA")
+    image = local.put("images/img.tar.gz", b"LOCAL-IMAGE")
+    pushed = []
+
+    async def push(sandbox, store, object_url, vm_path):
+        pushed.append((store, object_url))
+
+    monkeypatch.setattr(sandbox_module, "push_object_over_exec", push)
+    sandbox = _RecordingVmSandbox(images_stdout="myimage\n")
+
+    await sandbox.load_object_file(data, "/tmp/data.json")
+    await sandbox.load_docker_images([SimpleNamespace(tar_gz_object_url=image, image_name="myimage:latest")])
+
+    assert pushed == [(local, data), (local, image)]

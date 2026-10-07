@@ -33,6 +33,7 @@ _CAS_MAX_BACKOFF_SECONDS = 0.25
 _TABLE_POLL_SECONDS = 1
 _TABLE_POLL_ATTEMPTS = 120
 _UNINDEXED_SORT_KEY = "sk"
+_BATCH_GET_MAX_KEYS = 100
 
 
 def _json_default(o):
@@ -208,6 +209,30 @@ class DynamoDbDocumentStore(DocumentStore):
     def find_one(self, collection: str, filter: Filter, sort: Optional[Sort] = None) -> Optional[dict]:
         docs = evaluation.sort_docs(self._matching(collection, filter), sort)
         return docs[0] if docs else None
+
+    def find_many_by_id(self, collection: str, id_field: str, ids: list[str]) -> list[dict]:
+        identities = list(dict.fromkeys(ids))
+        if not identities or not self._table_exists(collection):
+            return []
+        if self._key_fields(collection) != [id_field]:
+            return super().find_many_by_id(collection, id_field, identities)
+        name = self._table_name(collection)
+        found = {}
+        for start in range(0, len(identities), _BATCH_GET_MAX_KEYS):
+            keys = [self._key(collection, {id_field: identity}) for identity in identities[start:start + _BATCH_GET_MAX_KEYS]]
+            pending = {name: {"Keys": keys, "ConsistentRead": True}}
+            for attempt in range(_CAS_ATTEMPTS):
+                result = self._client.batch_get_item(RequestItems=pending)
+                for item in result.get("Responses", {}).get(name, []):
+                    doc = json.loads(item["doc"]["S"])
+                    found.setdefault(doc[id_field], doc)
+                pending = result.get("UnprocessedKeys", {})
+                if not pending:
+                    break
+                time.sleep(random.uniform(0, min(_CAS_MAX_BACKOFF_SECONDS, _CAS_BACKOFF_SECONDS * 2**attempt)))
+            else:
+                raise TimeoutError(f"{collection!r}: DynamoDB batch read left unprocessed keys after {_CAS_ATTEMPTS} attempts")
+        return [found[identity] for identity in identities if identity in found]
 
     def query(
         self,
