@@ -22,7 +22,6 @@ from agent_env.a2a_agent.store import A2A_AGENTS_COLLECTION
 from agent_env.artifact.registry import canonical_type, get_artifact_registry
 from agent_env.artifact.store import ARTIFACTS_COLLECTION
 from agent_env.config import get_config
-from agent_env.env.env import Env
 from agent_env.env.registry import get_env_registry
 from agent_env.env.store import ENVS_COLLECTION
 from agent_env.eval.store import EVALS_COLLECTION
@@ -31,9 +30,9 @@ from agent_env.store.document_store import LocalSqliteDocumentStore
 from agent_env.store.local_state import holding_locks
 from agent_env.task.store import TASKS_COLLECTION
 
-from .authoring import build_context_files, entry_files
+from .authoring import build_context_files
 from .parse import Bundle, BundleKind
-from .plan import Plan, Write, folder_walk, keeps_base_from_toml, unpinned_store_refs
+from .plan import Plan, Write, env_writer, folder_walk, unpinned_store_refs
 from .resolve import BuiltImage
 
 LEDGER_COLLECTION = "bundle_ledger"
@@ -122,15 +121,15 @@ class Ledger:
                   "files": {}, "needs": {}, "store_refs": {}}
         if write.kind is BundleKind.ARTIFACT:
             built = isinstance(write.source, BuiltImage)
-            for key, path in (build_context_files if built else entry_files)(self._plan.bundle.bundle,
-                                                                              write.source.entry).items():
+            listing = build_context_files if built else folder_walk(get_artifact_registry().get(_type(write)))
+            for key, path in listing(self._plan.bundle.bundle, write.source.entry).items():
                 inputs["files"][key] = _file_sha256(path) + (_mode(path) if built else "")
-        elif write.kind in (BundleKind.ENV, BundleKind.AGENT):
-            # An env's or agent's document records the versions of what it references, so one written anew means
-            # it must be written again. A task or eval names its references without a version.
+        if write.kind not in (BundleKind.TASK, BundleKind.EVAL):
+            # A document records the versions of what it references (an env its images, a universe its
+            # environments), so one written anew means it must be written again. A task or eval names its
+            # references without a version.
             for store, id in write.needs:
                 inputs["needs"][f"{store} {id}"] = str(needs[store, id])
-        if write.kind not in (BundleKind.TASK, BundleKind.EVAL):
             for (kind, id), version in unpinned_store_refs(self._plan, write).items():
                 inputs["store_refs"][f"{kind} {id}"] = str(version)
         value = _sha256(_canonical({"scheme": SCHEME, "store": write.kind.store, "id": write.id, "inputs": inputs}))
@@ -200,9 +199,10 @@ def materializing(bundle: Bundle, on_wait: Callable[[], None] | None = None) -> 
 
 def _tracked(write: Write) -> bool:
     """Whether the ledger can list everything ``write`` is made from. Not yet for a skill, nor for a type with
-    a ``from_toml`` of its own, which may read its folder in ways it can't see. An agent is made from its
-    agent.toml alone: its image is a reference. A built image is made from its build context,
-    ``build_context_files``; what the build fetches (its base image, packages) isn't an input."""
+    a ``from_toml`` of its own, which may read its folder in ways it can't see. An artifact is made from its toml,
+    the files its type reads from its folder (``folder_walk``) and what it references; an agent or env from its
+    toml and what it references. A built image is made from its build context, ``build_context_files``; what the
+    build fetches (its base image, packages) isn't an input."""
     if isinstance(write.source, BuiltImage):
         return True
     if write.kind is BundleKind.SKILL:
@@ -210,8 +210,7 @@ def _tracked(write: Write) -> bool:
     if write.kind is BundleKind.ARTIFACT:
         return folder_walk(get_artifact_registry().get(_type(write))) is not None
     if write.kind is BundleKind.ENV:
-        cls = get_env_registry().get(_type(write))
-        return cls is not None and keeps_base_from_toml(cls, Env)
+        return env_writer(get_env_registry().get(_type(write)))
     return True
 
 
