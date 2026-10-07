@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import posixpath
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 # the partial bytes already consumed, corrupting the stream. Pipe consumers must
 # download to a temp file first, then read the file (see load_docker_images).
 CURL_RETRY_FLAGS = "--retry 5 --retry-all-errors --retry-delay 1"
+_DOCKER_IMAGE_INSPECT_FORMAT = "{{.Id}}"
 # Docker label on what a step starts on a sandbox's Docker host (containers, images, networks), valued with the
 # sandbox id, so a sandbox that shares its host (the local one) can remove its own when it terminates.
 SANDBOX_LABEL = "agentenv.sandbox"
@@ -281,31 +283,55 @@ class VmSandbox(Sandbox):
 
     async def _load_docker_images(self, artifacts: list, signed_urls: list[str | None]) -> None:
         load_commands = []
+        staging_paths = [f"/tmp/_docker_image_{self.sandbox_id}_{idx}.tar.gz" for idx in range(len(artifacts))]
         for idx, (artifact, signed) in enumerate(zip(artifacts, signed_urls, strict=True)):
-            tmp_tar = f"/tmp/_docker_image_{self.sandbox_id}_{idx}.tar.gz"
+            tmp_tar = staging_paths[idx]
             if signed is not None:
                 # Download to a file first (retry-safe with -o); a `curl | ... docker load`
                 # pipe can't be retried without corrupting the stream (curl won't rewind).
                 load_commands.append(
-                    f'(curl -fsSL {CURL_RETRY_FLAGS} "{signed}" -o {shlex.quote(tmp_tar)} '
-                    f"&& gunzip -c {shlex.quote(tmp_tar)} | docker load && rm -f {shlex.quote(tmp_tar)})"
+                    f'(curl -fsSL {CURL_RETRY_FLAGS} {shlex.quote(signed)} -o {shlex.quote(tmp_tar)} '
+                    f"&& gunzip -c {shlex.quote(tmp_tar)} | docker load)"
                 )
             else:
-                await self._download_object_to_vm(artifact.tar_gz_object_url, tmp_tar)
                 load_commands.append(
-                    f"(gunzip -c {shlex.quote(tmp_tar)} | docker load && rm -f {shlex.quote(tmp_tar)})"
+                    f"(gunzip -c {shlex.quote(tmp_tar)} | docker load)"
                 )
             logger.info(f"  Queued: {artifact.image_name}")
-        await self.exec_script(" & ".join(load_commands) + " & wait", max_retries=2)
+        try:
+            for idx, (artifact, signed) in enumerate(zip(artifacts, signed_urls, strict=True)):
+                if signed is None:
+                    await self._download_object_to_vm(artifact.tar_gz_object_url, staging_paths[idx])
+            # exec_script explicitly invokes `bash -c`; pipefail and wait-status
+            # collection therefore use the shell the provider actually guarantees.
+            workers = "\n".join(
+                f"{command} & pid_{idx}=$!" for idx, command in enumerate(load_commands)
+            )
+            waits = "\n".join(f"wait $pid_{idx} || status=1" for idx in range(len(load_commands)))
+            cleanup_command = "rm -f " + " ".join(shlex.quote(path) for path in staging_paths)
+            script = (
+                f"trap {shlex.quote(cleanup_command)} EXIT\n"
+                "set -o pipefail\n"
+                f"{workers}\n"
+                "status=0\n"
+                f"{waits}\n"
+                "exit $status"
+            )
+            await self.exec_script(script)
+        except BaseException:
+            # Download failures happen before the shell trap can be installed.
+            with contextlib.suppress(Exception):
+                await self._remove_vm_temp_file(*staging_paths)
+            raise
 
         logger.info("Verifying Docker images...")
-        exit_code, stdout, stderr = await self.exec_with_output("sudo", "docker", "images")
+        image_refs = [artifact.image_name for artifact in artifacts]
+        exit_code, _, stderr = await self.exec_with_output(
+            "sudo", "docker", "image", "inspect", "--format", _DOCKER_IMAGE_INSPECT_FORMAT,
+            *image_refs,
+        )
         if exit_code != 0:
-            raise RuntimeError(f"docker images failed: {stderr}")
-        for artifact in artifacts:
-            base_name = artifact.image_name.split(":")[0]
-            if base_name not in stdout:
-                raise RuntimeError(f"{artifact.image_name} image not found. stdout: {stdout}")
+            raise RuntimeError(f"Docker image reference verification failed for {image_refs}: {stderr}")
         logger.info("  All images loaded successfully")
 
     async def load_s3_file(self, s3_url: str, destination_path: str) -> None:

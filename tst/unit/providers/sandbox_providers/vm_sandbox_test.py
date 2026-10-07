@@ -1,4 +1,7 @@
 import asyncio
+import os
+import subprocess
+from pathlib import Path
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -33,10 +36,9 @@ def signing_store():
 class _RecordingVmSandbox(VmSandbox):
     """Concrete VmSandbox that records executed scripts instead of touching a VM."""
 
-    def __init__(self, images_stdout: str = ""):
+    def __init__(self):
         self.sandbox_id = "vm-test"
         self.scripts: list[str] = []
-        self._images_stdout = images_stdout
 
     async def terminate(self) -> None:  # pragma: no cover - not exercised
         pass
@@ -45,10 +47,9 @@ class _RecordingVmSandbox(VmSandbox):
         return None
 
     async def exec_with_output(self, *args):
-        # load_docker_images runs `sudo docker images` to verify; everything
-        # else flows through exec_script as `sudo bash -c <script>`.
-        if args[:2] == ("sudo", "docker") and "images" in args:
-            return 0, self._images_stdout, ""
+        # Image loading verifies exact refs through `docker image inspect`.
+        if args[:4] == ("sudo", "docker", "image", "inspect"):
+            return 0, "sha256:image", ""
         if args[:2] == ("sudo", "bash"):
             self.scripts.append(script_run(args))
         return 0, "", ""
@@ -65,7 +66,7 @@ async def test_load_docker_images_downloads_to_file_before_load(signing_store):
     because curl can't rewind bytes already piped to stdout, so the retry flags
     must only apply to a `-o file` download.
     """
-    sandbox = _RecordingVmSandbox(images_stdout="myimage\n")
+    sandbox = _RecordingVmSandbox()
     artifact = SimpleNamespace(tar_gz_object_url="s3://bucket/img.tar.gz", image_name="myimage:latest")
 
     await sandbox.load_docker_images([artifact])
@@ -79,11 +80,14 @@ async def test_load_docker_images_downloads_to_file_before_load(signing_store):
     assert "| gunzip" not in load_script.split("-o")[0]
     # gunzip reads from the downloaded file, not curl's stdout.
     assert "gunzip -c" in load_script
+    assert "set -o pipefail" in load_script
+    assert "wait $pid_0 || status=1" in load_script
+    assert "trap 'rm -f" in load_script
 
 
 @pytest.mark.asyncio
 async def test_load_docker_images_uses_unique_tmp_per_artifact(signing_store):
-    sandbox = _RecordingVmSandbox(images_stdout="a\nb\n")
+    sandbox = _RecordingVmSandbox()
     artifacts = [
         SimpleNamespace(tar_gz_object_url="s3://bucket/a.tar.gz", image_name="a:1"),
         SimpleNamespace(tar_gz_object_url="s3://bucket/b.tar.gz", image_name="b:1"),
@@ -94,6 +98,152 @@ async def test_load_docker_images_uses_unique_tmp_per_artifact(signing_store):
     load_script = next(s for s in sandbox.scripts if "docker load" in s)
     assert "/tmp/_docker_image_vm-test_0.tar.gz" in load_script
     assert "/tmp/_docker_image_vm-test_1.tar.gz" in load_script
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_loads"),
+    [("docker", ["fail", "ok"]), ("gunzip", ["ok", "ok"])],
+)
+async def test_load_image_worker_failure_propagates_and_cleans_staging(
+    tmp_path, failure_stage, expected_loads,
+):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_log = tmp_path / "docker-load.log"
+    _install_docker_load_stubs(
+        bin_dir,
+        fail_first=failure_stage == "docker",
+        gunzip_fail_first=failure_stage == "gunzip",
+    )
+    sandbox = _ShellVmSandbox(bin_dir, docker_log, f"lifecycle-{tmp_path.name}")
+    images = [
+        SimpleNamespace(tar_gz_object_url=f"s3://bucket/{i}", image_name=f"repo:{i}")
+        for i in range(2)
+    ]
+    with pytest.raises(RuntimeError, match="load script exited"):
+        await sandbox._load_docker_images(images, ["https://signed/a", "https://signed/b"])
+    assert sorted(docker_log.read_text().splitlines()) == expected_loads
+    assert all(
+        not Path(f"/tmp/_docker_image_{sandbox.sandbox_id}_{i}.tar.gz").exists()
+        for i in range(2)
+    )
+    assert not any("image" in call and "inspect" in call for call in sandbox.verify_calls)
+
+
+@pytest.mark.asyncio
+async def test_load_image_success_runs_every_worker_and_verifies_refs(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_log = tmp_path / "docker-load.log"
+    _install_docker_load_stubs(bin_dir)
+
+    sandbox = _ShellVmSandbox(bin_dir, docker_log, f"lifecycle-{tmp_path.name}")
+    images = [
+        SimpleNamespace(tar_gz_object_url=f"s3://bucket/{i}", image_name=f"repo:{i}")
+        for i in range(2)
+    ]
+    await sandbox._load_docker_images(images, ["https://signed/a", "https://signed/b"])
+    assert sorted(docker_log.read_text().splitlines()) == ["ok", "ok"]
+    assert sandbox.verify_calls == [(
+        "sudo", "docker", "image", "inspect", "--format", "{{.Id}}", "repo:0", "repo:1",
+    )]
+
+
+class _ShellVmSandbox(_RecordingVmSandbox):
+    def __init__(self, bin_dir, docker_log, sandbox_id):
+        super().__init__()
+        self.bin_dir = bin_dir
+        self.docker_log = docker_log
+        self.sandbox_id = sandbox_id
+        self.verify_calls = []
+
+    async def exec_script(self, script, *, max_retries=0):
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin_dir}:{os.environ['PATH']}",
+            DOCKER_LOG=str(self.docker_log),
+        )
+        result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(f"load script exited {result.returncode}")
+        self.scripts.append(script)
+
+    async def exec_with_output(self, *args):
+        self.verify_calls.append(args)
+        return await super().exec_with_output(*args)
+
+
+def _install_docker_load_stubs(bin_dir, *, fail_first=False, gunzip_fail_first=False):
+    curl_result = (
+        'case "$url" in */a) printf fail > "$1" ;; *) printf ok > "$1" ;; esac\n'
+        if fail_first else 'printf ok > "$1"\n'
+    )
+    gunzip_script = '#!/bin/sh\ncat "$2"\n'
+    if gunzip_fail_first:
+        gunzip_script = '#!/bin/sh\ncat "$2"\ncase "$2" in *_0.tar.gz) exit 24 ;; esac\n'
+    for name, body in {
+        "curl": (
+            '#!/bin/sh\nurl=\nwhile [ "$1" != "-o" ]; do url=$1; shift; done\n'
+            "shift\n" + curl_result
+        ),
+        "gunzip": gunzip_script,
+        "docker": '#!/bin/sh\npayload=$(cat)\nprintf "%s\\n" "$payload" >> "$DOCKER_LOG"\n'
+        '[ "$payload" = fail ] && exit 23\nexit 0\n',
+    }.items():
+        path = bin_dir / name
+        path.write_text(body)
+        path.chmod(0o755)
+
+
+@pytest.mark.asyncio
+async def test_load_image_requires_exact_reference_even_when_old_tag_is_listed(signing_store):
+    class StaleTagVm(_RecordingVmSandbox):
+        async def exec_with_output(self, *args):
+            if args[:4] == ("sudo", "docker", "image", "inspect"):
+                existing_refs = {"registry.example:5000/team/repo:old-tag"}
+                requested_refs = set(args[6:])
+                if requested_refs <= existing_refs:
+                    return 0, "sha256:old", ""
+                return 1, "", "No such image"
+            return await super().exec_with_output(*args)
+
+    sandbox = StaleTagVm()
+    image = SimpleNamespace(
+        tar_gz_object_url="s3://bucket/img",
+        image_name="registry.example:5000/team/repo:new-tag",
+    )
+    with pytest.raises(RuntimeError, match="registry.example:5000/team/repo:new-tag"):
+        await sandbox.load_docker_images([image])
+
+
+@pytest.mark.asyncio
+async def test_unsigned_download_failure_cleans_staging_file(signing_store, tmp_path):
+    cleaned = []
+
+    class UnsignedStore(_SigningStore):
+        def signed_get_url(self, object_url, expires_in=3600):
+            return None
+
+    set_object_store(UnsignedStore())
+
+    class FailedDownloadVm(_RecordingVmSandbox):
+        async def _download_object_to_vm(self, _object_url, vm_path):
+            Path(vm_path).write_text("partial")
+            raise RuntimeError("download failed")
+
+        async def _remove_vm_temp_file(self, *vm_paths):
+            cleaned.extend(vm_paths)
+            for vm_path in vm_paths:
+                Path(vm_path).unlink(missing_ok=True)
+
+    sandbox = FailedDownloadVm()
+    sandbox.sandbox_id = f"lifecycle-{tmp_path.name}"
+    artifact = SimpleNamespace(tar_gz_object_url="obj://image", image_name="repo:tag")
+    with pytest.raises(RuntimeError, match="download failed"):
+        await sandbox._load_docker_images([artifact], [None])
+    assert cleaned == [f"/tmp/_docker_image_{sandbox.sandbox_id}_0.tar.gz"]
+    assert not Path(cleaned[0]).exists()
 
 
 class _ScriptRecorder(VmSandbox):
@@ -238,7 +388,7 @@ async def test_load_docker_images_streams_through_when_unsigned():
 
     set_object_store(_LocalStore())
     try:
-        sandbox = _RecordingVmSandbox(images_stdout="myimage\n")
+        sandbox = _RecordingVmSandbox()
         artifact = SimpleNamespace(tar_gz_object_url="file:///store/img.tar.gz", image_name="myimage:latest")
         await sandbox.load_docker_images([artifact])
     finally:
@@ -279,7 +429,7 @@ async def test_the_store_is_called_off_the_event_loop(signs):
     store = _LoopCheckingStore(signs)
     set_object_store(store)
     try:
-        sandbox = _RecordingVmSandbox(images_stdout="a\nb\n")
+        sandbox = _RecordingVmSandbox()
         artifacts = [SimpleNamespace(tar_gz_object_url=f"s3://bucket/{n}.tar.gz", image_name=f"{n}:1") for n in "ab"]
         await sandbox.load_docker_images(artifacts)
         await sandbox.load_s3_file("s3://bucket/data.json", "/tmp/data.json")
@@ -365,7 +515,7 @@ async def test_a_load_bounds_how_many_signs_run_at_once():
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=32))
     try:
         names = [f"i{n}" for n in range(20)]
-        sandbox = _RecordingVmSandbox(images_stdout="\n".join(names))
+        sandbox = _RecordingVmSandbox()
         await sandbox.load_docker_images(
             [SimpleNamespace(tar_gz_object_url=f"s3://bucket/{n}.tar.gz", image_name=f"{n}:1") for n in names]
         )
