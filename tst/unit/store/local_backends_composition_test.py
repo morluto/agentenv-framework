@@ -20,6 +20,7 @@ from agent_env.artifact.artifacts.cli import CliArtifact
 from agent_env.artifact.artifacts.file import FileArtifact
 from agent_env.artifact.artifacts.file_artifact_universe import FileArtifactUniverse
 from agent_env.artifact.artifacts.skill import SkillArtifact, download_skill
+from agent_env.artifact.store import get_artifact_store
 from agent_env.cli.artifact.file_artifact_universe import file_artifact_universe
 from agent_env.store.ids import fs_safe, key_segment
 from agent_env.config import get_config, set_image_store, set_object_store
@@ -179,15 +180,39 @@ def test_a_local_id_file_artifact_lands_under_its_encoded_segment(local_stores, 
     fb = FileArtifact.put_bytes(id=HOSTILE, description="d", filename="raw.bin", content=b"raw")
 
     store = local_stores.get_object_store()
-    assert store.get_object_key(fa.object_url) == f"artifacts/file/{HOSTILE_SEGMENT}/1/payload.json"
-    assert store.get_object_key(fb.object_url) == f"artifacts/file/{HOSTILE_SEGMENT}/2/raw.bin"
+    assert re.fullmatch(
+        rf"artifacts/file/{re.escape(HOSTILE_SEGMENT)}/1-[0-9a-f]{{8}}/payload.json",
+        store.get_object_key(fa.object_url),
+    )
+    assert re.fullmatch(
+        rf"artifacts/file/{re.escape(HOSTILE_SEGMENT)}/2-[0-9a-f]{{8}}/raw.bin",
+        store.get_object_key(fb.object_url),
+    )
     assert FileArtifact.get(HOSTILE, 1).load() == b'{"hostile": true}'
     assert FileArtifact.get(HOSTILE).load() == b"raw"
 
 
-def test_a_legacy_id_keeps_its_object_key_byte_identical(local_stores, tmp_path):
+def test_a_legacy_id_keeps_its_encoded_segment_in_the_object_key(local_stores, tmp_path):
     fa = FileArtifact.put(id="Legacy/Id v1", description="d", file_path=_write(tmp_path, "p.txt", b"x"))
-    assert local_stores.get_object_store().get_object_key(fa.object_url) == "artifacts/file/Legacy/Id v1/1/p.txt"
+    key = local_stores.get_object_store().get_object_key(fa.object_url)
+    assert re.fullmatch(r"artifacts/file/Legacy/Id v1/1-[0-9a-f]{8}/p.txt", key)
+    assert fa.load() == b"x"
+
+
+def test_a_published_file_with_an_existing_version_locator_still_loads(local_stores, tmp_path):
+    objects = local_stores.get_object_store()
+    old_locator = objects.put_file(
+        "artifacts/file/Legacy/Id v1/1/p.txt", _write(tmp_path, "old.txt", b"published before attempt prefixes")
+    )
+    stored = get_artifact_store().put_document(
+        FileArtifact(
+            id="old-file", version=1, description="old", filename="p.txt",
+            content_type="text/plain", s3_url=old_locator,
+        )
+    )
+
+    assert stored.object_url == old_locator
+    assert FileArtifact.get("old-file").load() == b"published before attempt prefixes"
 
 
 def _cli_dir(tmp_path, name, files):
@@ -222,9 +247,17 @@ class _DockerSave:
         self.stdout = io.BytesIO(b"image-tar-bytes")
         self.stderr = io.BytesIO(b"")
         self.returncode = 0
+        self.args = args[0] if args else []
 
     def wait(self, timeout=None):
+        self.returncode = 0
         return 0
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
 
 
 @pytest.mark.parametrize("entity_id, registry, repository, tarball", [

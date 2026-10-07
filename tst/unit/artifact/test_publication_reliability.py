@@ -18,6 +18,8 @@ _STREAM_TEST_MIB = 16
 _MIB = 1024 * 1024
 _WATCHDOG_TEST_SECONDS = 2
 _RETRY_PAYLOAD_MULTIPLIER = 1000
+_DESCENDANT_MARKER_DELAY_SECONDS = 0.5
+_DESCENDANT_SETTLE_SECONDS = 0.6
 
 
 def _install_fake_docker(tmp_path: Path, monkeypatch, body: str) -> None:
@@ -139,6 +141,43 @@ def test_docker_save_compression_error_kills_child_and_cleans_archive(local_stor
     with pytest.raises(OSError, match="disk full"):
         _save_image_tar_gz("example:latest", archive, _SAVE_FAILURE_TIMEOUT_SECONDS)
 
+    assert not archive.exists()
+
+
+def test_docker_save_compression_error_kills_descendant_after_leader_exit(
+    local_stores, tmp_path, monkeypatch
+):
+    marker = tmp_path / "descendant-survived"
+    child_script = (
+        f"import time; time.sleep({_DESCENDANT_MARKER_DELAY_SECONDS}); "
+        f"open({str(marker)!r}, 'w').close()"
+    )
+    _install_fake_docker(
+        tmp_path,
+        monkeypatch,
+        f"import subprocess, sys\nsubprocess.Popen([sys.executable, '-c', {child_script!r}])",
+    )
+    archive = tmp_path / "image.tar.gz"
+    launched_processes = []
+    real_popen = docker_image_module.subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        launched_processes.append(process)
+        return process
+
+    monkeypatch.setattr(docker_image_module.subprocess, "Popen", recording_popen)
+
+    def fail_after_leader_exit(*args, **kwargs):
+        launched_processes[0].wait(timeout=_SAVE_FAILURE_TIMEOUT_SECONDS)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(docker_image_module.gzip, "open", fail_after_leader_exit)
+    with pytest.raises(OSError, match="disk full"):
+        _save_image_tar_gz("example:latest", archive, _SAVE_FAILURE_TIMEOUT_SECONDS)
+
+    time.sleep(_DESCENDANT_SETTLE_SECONDS)
+    assert not marker.exists()
     assert not archive.exists()
 
 

@@ -77,9 +77,13 @@ def _save_image_tar_gz(image_ref: str, output_path: Path, timeout_seconds: float
             **process_options,
         )
         timed_out = threading.Event()
+        kill_sent = False
 
         def kill_process() -> None:
+            nonlocal kill_sent
             timed_out.set()
+            if kill_sent:
+                return
             if os.name == "posix":
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -87,6 +91,7 @@ def _save_image_tar_gz(image_ref: str, output_path: Path, timeout_seconds: float
                     pass
             elif process.poll() is None:
                 process.kill()
+            kill_sent = True
 
         watchdog = threading.Timer(max(deadline - time.monotonic(), 0), kill_process)
         watchdog.daemon = True
@@ -117,7 +122,7 @@ def _save_image_tar_gz(image_ref: str, output_path: Path, timeout_seconds: float
         finally:
             watchdog.cancel()
             watchdog.join()
-            if process.poll() is None:
+            if not succeeded or process.poll() is None:
                 kill_process()
             process.wait()
             if process.stdout is not None:
