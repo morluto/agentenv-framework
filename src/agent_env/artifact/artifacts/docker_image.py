@@ -8,12 +8,12 @@ import logging
 import os
 import posixpath
 import re
+import selectors
 import shlex
 import signal
 import subprocess
 import tarfile
 import tempfile
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -70,69 +70,49 @@ def _git_clone_commands(owner: str, repo: str, ref: str | None, token: str | Non
 def _save_image_tar_gz(image_ref: str, output_path: Path, timeout_seconds: float) -> None:
     """Stream docker save through gzip under one deadline without buffering the image."""
     deadline = time.monotonic() + timeout_seconds
-    process_options = {"start_new_session": True} if os.name == "posix" else {}
     process = subprocess.Popen(
         ["docker", "save", image_ref],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        **process_options,
+        bufsize=0,
+        start_new_session=True,
     )
-    timed_out = threading.Event()
-    kill_sent = False
     stderr_tail = bytearray()
     stderr_size = 0
-    stderr_errors: list[BaseException] = []
-
-    def kill_process_group() -> None:
-        nonlocal kill_sent
-        timed_out.set()
-        if kill_sent:
-            return
-        if os.name == "posix":
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        elif process.returncode is None:
-            process.kill()
-        kill_sent = True
-
-    def drain_stderr() -> None:
-        nonlocal stderr_size
-        try:
-            assert process.stderr is not None
-            while chunk := process.stderr.read(_DOCKER_SAVE_STDERR_CHUNK_SIZE):
-                stderr_size += len(chunk)
-                stderr_tail.extend(chunk)
-                if len(stderr_tail) > _DOCKER_SAVE_STDERR_LIMIT_BYTES:
-                    del stderr_tail[:-_DOCKER_SAVE_STDERR_LIMIT_BYTES]
-        except Exception as error:
-            stderr_errors.append(error)
-
-    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-    stderr_thread.start()
-    watchdog = threading.Timer(max(deadline - time.monotonic(), 0), kill_process_group)
-    watchdog.daemon = True
-    watchdog.start()
     succeeded = False
     try:
         assert process.stdout is not None
-        with gzip.open(output_path, "wb") as compressed:
-            while chunk := process.stdout.read(_DOCKER_SAVE_CHUNK_SIZE):
-                if timed_out.is_set():
-                    raise subprocess.TimeoutExpired(process.args, timeout_seconds)
-                compressed.write(chunk)
-        stderr_thread.join(timeout=max(deadline - time.monotonic(), 0))
-        if stderr_thread.is_alive() or timed_out.is_set():
-            raise subprocess.TimeoutExpired(process.args, timeout_seconds)
-        if stderr_errors:
-            raise RuntimeError(f"docker save {image_ref} stderr could not be read") from stderr_errors[0]
+        assert process.stderr is not None
+        with selectors.DefaultSelector() as selector:
+            for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, name)
+            with gzip.open(output_path, "wb") as compressed:
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+                    for key, _ in selector.select(remaining):
+                        chunk_size = (
+                            _DOCKER_SAVE_CHUNK_SIZE
+                            if key.data == "stdout"
+                            else _DOCKER_SAVE_STDERR_CHUNK_SIZE
+                        )
+                        chunk = os.read(key.fd, chunk_size)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                        elif key.data == "stdout":
+                            compressed.write(chunk)
+                        else:
+                            stderr_size += len(chunk)
+                            stderr_tail.extend(chunk)
+                            if len(stderr_tail) > _DOCKER_SAVE_STDERR_LIMIT_BYTES:
+                                del stderr_tail[:-_DOCKER_SAVE_STDERR_LIMIT_BYTES]
 
-        watchdog.cancel()
-        watchdog.join()
-        if timed_out.is_set() or time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise subprocess.TimeoutExpired(process.args, timeout_seconds)
-        process.wait(timeout=max(deadline - time.monotonic(), 0))
+        process.wait(timeout=remaining)
         if process.returncode != 0:
             stderr = stderr_tail.decode(errors="replace")
             if stderr_size > _DOCKER_SAVE_STDERR_LIMIT_BYTES:
@@ -144,17 +124,19 @@ def _save_image_tar_gz(image_ref: str, output_path: Path, timeout_seconds: float
             f"docker save {image_ref} timed out after {timeout_seconds} seconds"
         ) from error
     finally:
-        watchdog.cancel()
-        watchdog.join()
-        if process.returncode is None and not succeeded:
-            kill_process_group()
         if process.returncode is None:
-            process.wait()
-        stderr_thread.join()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                process.kill()
         if process.stdout is not None:
             process.stdout.close()
         if process.stderr is not None:
             process.stderr.close()
+        if process.returncode is None:
+            process.wait()
         if not succeeded:
             output_path.unlink(missing_ok=True)
 

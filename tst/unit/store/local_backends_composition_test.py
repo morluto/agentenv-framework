@@ -8,7 +8,6 @@ layer works; the full task-DAG no-infra e2e stays gated on images/secrets/seedin
 """
 
 import gzip
-import io
 import re
 from pathlib import Path
 
@@ -242,22 +241,9 @@ def test_a_local_id_bundle_never_lists_another_ids_files(local_stores, cli_routi
         assert sorted(p.name for p in out.rglob("*") if p.is_file()) == ["a"]
 
 
-class _DockerSave:
-    def __init__(self, *args, **kwargs):
-        self.stdout = io.BytesIO(b"image-tar-bytes")
-        self.stderr = io.BytesIO(b"")
-        self.returncode = 0
-        self.args = args[0] if args else []
-
-    def wait(self, timeout=None):
-        self.returncode = 0
-        return 0
-
-    def poll(self):
-        return self.returncode
-
-    def kill(self):
-        self.returncode = -9
+def _save_fake_docker_image(image_ref, output_path, timeout_seconds):
+    with gzip.open(output_path, "wb") as image_archive:
+        image_archive.write(b"image-tar-bytes")
 
 
 @pytest.mark.parametrize("entity_id, registry, repository, tarball", [
@@ -275,7 +261,7 @@ def test_a_docker_image_names_its_repository_and_tarball_from_the_encoded_id(
     monkeypatch.setattr(LocalRegistryImageStore, "ensure_repository", lambda self, repository: local_registry.append(repository))
     pushed = []
     monkeypatch.setattr(docker_image, "_push_local_image", lambda src, ref, store: pushed.append(ref))
-    monkeypatch.setattr(docker_image.subprocess, "Popen", _DockerSave)
+    monkeypatch.setattr(docker_image, "_save_image_tar_gz", _save_fake_docker_image)
 
     art = docker_image.DockerImageArtifact.put(id=entity_id, description="d", image_name="src:latest")
 
@@ -305,7 +291,6 @@ def test_an_local_id_outside_the_cli_is_refused_before_any_image_or_object_is_wr
     set_image_store(images)
     pushed = []
     monkeypatch.setattr(docker_image, "_push_local_image", lambda src, ref, store: pushed.append(ref))
-    monkeypatch.setattr(docker_image.subprocess, "Popen", _DockerSave)
 
     with pytest.raises(ValueError, match="only the @local namespace's store holds"):
         put(tmp_path)
@@ -354,7 +339,7 @@ def test_a_put_bundled_that_fails_partway_doesnt_block_the_next(local_stores, mo
 def test_a_docker_image_put_that_stops_before_its_document_doesnt_block_the_next(local_stores, monkeypatch):
     set_image_store(FakeImageStore())
     monkeypatch.setattr(docker_image, "_push_local_image", lambda src, ref, store: None)
-    monkeypatch.setattr(docker_image.subprocess, "Popen", _DockerSave)
+    monkeypatch.setattr(docker_image, "_save_image_tar_gz", _save_fake_docker_image)
     put_tar = docker_image.DockerImageArtifact.put_tar
 
     def interrupted(*args, **kwargs):

@@ -1,5 +1,6 @@
 import gzip
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -23,6 +24,10 @@ _DESCENDANT_MARKER_DELAY_SECONDS = 0.5
 _DESCENDANT_SETTLE_SECONDS = 0.6
 _LEADER_EXIT_POLL_SECONDS = 0.01
 _MAX_DOCKER_ERROR_CHARS = 20 * 1024
+_DESCENDANT_RELEASE_SECONDS = 3
+_DESCENDANT_AUTO_EXIT_SECONDS = 5
+_ESCAPED_DESCENDANT_TIMEOUT_SECONDS = 1.5
+_ESCAPED_DESCENDANT_TEST_TIMEOUT_SECONDS = 4
 
 
 def _install_fake_docker(tmp_path: Path, monkeypatch, body: str) -> None:
@@ -30,6 +35,13 @@ def _install_fake_docker(tmp_path: Path, monkeypatch, body: str) -> None:
     executable.write_text(f"#!/usr/bin/env python3\n{body}\n")
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+
+
+@pytest.fixture
+def detached_child_release(tmp_path, request):
+    release = tmp_path / "release-descendant"
+    request.addfinalizer(lambda: release.touch())
+    return release
 
 
 @pytest.mark.parametrize("api", ["path", "bytes"])
@@ -117,6 +129,47 @@ def test_docker_save_timeout_kills_descendant_holding_stdout(local_stores, tmp_p
 
     assert time.monotonic() - started < _WATCHDOG_TEST_SECONDS
     assert not archive.exists()
+
+
+@pytest.mark.parametrize("held_stream", ["stdout", "stderr"])
+@pytest.mark.timeout(_ESCAPED_DESCENDANT_TEST_TIMEOUT_SECONDS)
+def test_docker_save_timeout_returns_when_escaped_descendant_holds_pipe(
+    local_stores, tmp_path, monkeypatch, detached_child_release, held_stream
+):
+    child_pid_file = tmp_path / "detached-child.pid"
+    child_exit_file = tmp_path / "detached-child-exited"
+    child_script = (
+        "import pathlib, sys, time\n"
+        f"release = pathlib.Path({str(detached_child_release)!r})\n"
+        f"deadline = time.monotonic() + {_DESCENDANT_AUTO_EXIT_SECONDS}\n"
+        f"while not release.exists() and time.monotonic() < deadline: time.sleep({_LEADER_EXIT_POLL_SECONDS})\n"
+        f"pathlib.Path({str(child_exit_file)!r}).touch()\n"
+    )
+    pipe_args = "stdout=None, stderr=subprocess.DEVNULL" if held_stream == "stdout" else "stdout=subprocess.DEVNULL, stderr=None"
+    _install_fake_docker(
+        tmp_path,
+        monkeypatch,
+        "import pathlib, subprocess, sys\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_script!r}], "
+        f"start_new_session=True, {pipe_args})\n"
+        f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))",
+    )
+    archive = tmp_path / "image.tar.gz"
+    thread_ids_before = {thread.ident for thread in threading.enumerate()}
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        _save_image_tar_gz("example:latest", archive, _ESCAPED_DESCENDANT_TIMEOUT_SECONDS)
+
+    assert time.monotonic() - started < _ESCAPED_DESCENDANT_TEST_TIMEOUT_SECONDS
+    assert child_pid_file.exists()
+    assert not archive.exists()
+    detached_child_release.touch()
+    exit_deadline = time.monotonic() + _DESCENDANT_RELEASE_SECONDS
+    while not child_exit_file.exists() and time.monotonic() < exit_deadline:
+        time.sleep(_LEADER_EXIT_POLL_SECONDS)
+    assert child_exit_file.exists()
+    assert {thread.ident for thread in threading.enumerate()} <= thread_ids_before
 
 
 def test_docker_save_failure_removes_partial_archive(local_stores, tmp_path, monkeypatch):
