@@ -9,9 +9,12 @@ import os
 import posixpath
 import re
 import shlex
+import signal
 import subprocess
 import tarfile
 import tempfile
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from importlib.metadata import version as pkg_version
@@ -29,6 +32,7 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[str, str, int], None]
 
 _SAFE_GIT_NAME = re.compile(r"^[a-zA-Z0-9._-]+$")
+_DOCKER_SAVE_CHUNK_SIZE = 1024 * 1024
 
 
 def _validate_git_name(value: str, label: str) -> str:
@@ -59,6 +63,67 @@ def _git_clone_commands(owner: str, repo: str, ref: str | None, token: str | Non
         "chmod +x /tmp/git-askpass.sh",
         f"trap 'rm -f /tmp/git-askpass.sh' EXIT; GIT_ASKPASS=/tmp/git-askpass.sh git clone --depth 1 {ref_flag} {clone_url} /tmp/repo",
     ]
+
+
+def _save_image_tar_gz(image_ref: str, output_path: Path, timeout_seconds: float) -> None:
+    """Stream docker save through gzip under one deadline without buffering the image."""
+    deadline = time.monotonic() + timeout_seconds
+    with tempfile.TemporaryFile() as stderr_file:
+        process_options = {"start_new_session": True} if os.name == "posix" else {}
+        process = subprocess.Popen(
+            ["docker", "save", image_ref],
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            **process_options,
+        )
+        timed_out = threading.Event()
+
+        def kill_process() -> None:
+            timed_out.set()
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            elif process.poll() is None:
+                process.kill()
+
+        watchdog = threading.Timer(max(deadline - time.monotonic(), 0), kill_process)
+        watchdog.daemon = True
+        watchdog.start()
+        succeeded = False
+        try:
+            assert process.stdout is not None
+            with gzip.open(output_path, "wb") as compressed:
+                while chunk := process.stdout.read(_DOCKER_SAVE_CHUNK_SIZE):
+                    if timed_out.is_set():
+                        raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+                    compressed.write(chunk)
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+            remaining = deadline - time.monotonic()
+            process.wait(timeout=max(remaining, 0))
+            if timed_out.is_set():
+                raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+            if process.returncode != 0:
+                stderr_file.seek(0)
+                stderr = stderr_file.read().decode(errors="replace")
+                raise RuntimeError(f"docker save {image_ref} failed: {stderr}")
+            succeeded = True
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"docker save {image_ref} timed out after {timeout_seconds} seconds"
+            ) from error
+        finally:
+            watchdog.cancel()
+            watchdog.join()
+            if process.poll() is None:
+                kill_process()
+            process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+            if not succeeded:
+                output_path.unlink(missing_ok=True)
 
 class DockerImageArtifact(Artifact):
     """A Docker image artifact stored as tar.gz in S3."""
@@ -102,22 +167,7 @@ class DockerImageArtifact(Artifact):
             tmp_path = Path(tmp.name)
 
         try:
-            save_proc = subprocess.Popen(
-                ["docker", "save", image_ref],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            with gzip.open(tmp_path, "wb") as gz_file:
-                while chunk := save_proc.stdout.read(8192):
-                    gz_file.write(chunk)
-            try:
-                save_proc.wait(timeout=cls.DOCKER_SAVE_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                save_proc.kill()
-                raise RuntimeError(f"docker save {image_ref} timed out after {cls.DOCKER_SAVE_TIMEOUT_SECONDS} seconds")
-            if save_proc.returncode != 0:
-                stderr = save_proc.stderr.read().decode() if save_proc.stderr else ""
-                raise RuntimeError(f"docker save {image_ref} failed: {stderr}")
+            _save_image_tar_gz(image_ref, tmp_path, cls.DOCKER_SAVE_TIMEOUT_SECONDS)
 
             tar_gz_object_url = objects.put_file_at(
                 f"{prefix}{fs_safe(id)}-v{version}.tar.gz", str(tmp_path), "application/gzip"
