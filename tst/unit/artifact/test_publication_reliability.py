@@ -14,12 +14,15 @@ _SAVE_TIMEOUT_SECONDS = 0.25
 _SAVE_SUCCESS_TIMEOUT_SECONDS = 30
 _SAVE_FAILURE_TIMEOUT_SECONDS = 3
 _FAKE_DOCKER_STDERR_BYTES = 1024 * 1024
+_LARGE_STDERR_BYTES = 2 * 1024 * 1024
 _STREAM_TEST_MIB = 16
 _MIB = 1024 * 1024
 _WATCHDOG_TEST_SECONDS = 2
 _RETRY_PAYLOAD_MULTIPLIER = 1000
 _DESCENDANT_MARKER_DELAY_SECONDS = 0.5
 _DESCENDANT_SETTLE_SECONDS = 0.6
+_LEADER_EXIT_POLL_SECONDS = 0.01
+_MAX_DOCKER_ERROR_CHARS = 20 * 1024
 
 
 def _install_fake_docker(tmp_path: Path, monkeypatch, body: str) -> None:
@@ -130,6 +133,45 @@ def test_docker_save_failure_removes_partial_archive(local_stores, tmp_path, mon
     assert not archive.exists()
 
 
+def test_docker_save_bounds_captured_stderr_for_large_failure(local_stores, tmp_path, monkeypatch):
+    _install_fake_docker(
+        tmp_path,
+        monkeypatch,
+        "import os\n"
+        "os.write(2, b'begin')\n"
+        f"os.write(2, b'x' * {_LARGE_STDERR_BYTES})\n"
+        "os.write(2, b'end-marker')\n"
+        "raise SystemExit(7)",
+    )
+    archive = tmp_path / "image.tar.gz"
+
+    with pytest.raises(RuntimeError, match="stderr truncated") as raised:
+        _save_image_tar_gz("example:latest", archive, _SAVE_SUCCESS_TIMEOUT_SECONDS)
+
+    assert "end-marker" in str(raised.value)
+    assert "begin" not in str(raised.value)
+    assert len(str(raised.value)) < _MAX_DOCKER_ERROR_CHARS
+    assert not archive.exists()
+
+
+def test_docker_save_does_not_signal_group_after_leader_is_reaped(local_stores, tmp_path, monkeypatch):
+    _install_fake_docker(tmp_path, monkeypatch, "raise SystemExit(7)")
+    archive = tmp_path / "image.tar.gz"
+    signaled_groups = []
+    real_killpg = docker_image_module.os.killpg
+
+    def track_killpg(group_id, signal_number):
+        signaled_groups.append(group_id)
+        return real_killpg(group_id, signal_number)
+
+    monkeypatch.setattr(docker_image_module.os, "killpg", track_killpg)
+    with pytest.raises(RuntimeError, match="docker save"):
+        _save_image_tar_gz("example:latest", archive, _SAVE_SUCCESS_TIMEOUT_SECONDS)
+
+    assert signaled_groups == []
+    assert not archive.exists()
+
+
 def test_docker_save_compression_error_kills_child_and_cleans_archive(local_stores, tmp_path, monkeypatch):
     _install_fake_docker(tmp_path, monkeypatch, "import time\ntime.sleep(30)")
     archive = tmp_path / "image.tar.gz"
@@ -147,29 +189,30 @@ def test_docker_save_compression_error_kills_child_and_cleans_archive(local_stor
 def test_docker_save_compression_error_kills_descendant_after_leader_exit(
     local_stores, tmp_path, monkeypatch
 ):
-    marker = tmp_path / "descendant-survived"
+    leader_exit_marker = tmp_path / "leader-exited"
+    survival_marker = tmp_path / "descendant-survived"
     child_script = (
-        f"import time; time.sleep({_DESCENDANT_MARKER_DELAY_SECONDS}); "
-        f"open({str(marker)!r}, 'w').close()"
+        "import os, sys, time\n"
+        "parent = int(sys.argv[1])\n"
+        "while os.getppid() == parent: time.sleep(0.01)\n"
+        "open(sys.argv[2], 'w').close()\n"
+        f"time.sleep({_DESCENDANT_MARKER_DELAY_SECONDS})\n"
+        "open(sys.argv[3], 'w').close()\n"
     )
     _install_fake_docker(
         tmp_path,
         monkeypatch,
-        f"import subprocess, sys\nsubprocess.Popen([sys.executable, '-c', {child_script!r}])",
+        "import os, subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}, str(os.getpid()), "
+        f"{str(leader_exit_marker)!r}, {str(survival_marker)!r}])",
     )
     archive = tmp_path / "image.tar.gz"
-    launched_processes = []
-    real_popen = docker_image_module.subprocess.Popen
-
-    def recording_popen(*args, **kwargs):
-        process = real_popen(*args, **kwargs)
-        launched_processes.append(process)
-        return process
-
-    monkeypatch.setattr(docker_image_module.subprocess, "Popen", recording_popen)
 
     def fail_after_leader_exit(*args, **kwargs):
-        launched_processes[0].wait(timeout=_SAVE_FAILURE_TIMEOUT_SECONDS)
+        marker_deadline = time.monotonic() + _SAVE_FAILURE_TIMEOUT_SECONDS
+        while not leader_exit_marker.exists() and time.monotonic() < marker_deadline:
+            time.sleep(_LEADER_EXIT_POLL_SECONDS)
+        assert leader_exit_marker.exists()
         raise OSError("disk full")
 
     monkeypatch.setattr(docker_image_module.gzip, "open", fail_after_leader_exit)
@@ -177,7 +220,8 @@ def test_docker_save_compression_error_kills_descendant_after_leader_exit(
         _save_image_tar_gz("example:latest", archive, _SAVE_FAILURE_TIMEOUT_SECONDS)
 
     time.sleep(_DESCENDANT_SETTLE_SECONDS)
-    assert not marker.exists()
+    assert leader_exit_marker.exists()
+    assert not survival_marker.exists()
     assert not archive.exists()
 
 
