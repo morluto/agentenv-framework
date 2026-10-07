@@ -114,6 +114,7 @@ def test_implicit_scheduler_graph_is_a_predecessor_chain():
 
     state = task._build_scheduler_state(task.steps, start_step=0)
 
+    assert state.dependencies == {"0": set(), "1": {"0"}, "2": {"1"}, "3": {"2"}, "4": {"3"}}
     assert state.dependents == {"0": ["1"], "1": ["2"], "2": ["3"], "3": ["4"], "4": []}
     assert state.pending == {"0": 0, "1": 1, "2": 1, "3": 1, "4": 1}
 
@@ -125,6 +126,7 @@ def test_mixed_scheduler_graph_keeps_implicit_all_prior_edges():
 
     state = task._build_scheduler_state(task.steps, start_step=0)
 
+    assert state.dependencies == {"a": set(), "b": set(), "c": {"a", "b"}}
     assert state.dependents == {"a": ["c"], "b": ["c"], "c": []}
     assert state.pending == {"a": 0, "b": 0, "c": 2}
 
