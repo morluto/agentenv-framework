@@ -719,7 +719,7 @@ async def test_a_url_the_local_store_holds_is_read_from_it_not_the_configured_st
         pushed.append((store, object_url))
 
     monkeypatch.setattr(sandbox_module, "push_object_over_exec", push)
-    sandbox = _RecordingVmSandbox(images_stdout="myimage\n")
+    sandbox = _RecordingVmSandbox()
 
     await sandbox.load_object_file(data, "/tmp/data.json")
     await sandbox.load_docker_images([SimpleNamespace(tar_gz_object_url=image, image_name="myimage:latest")])
