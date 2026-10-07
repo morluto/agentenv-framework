@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import base64
 import logging
 import os
 import posixpath
@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 # download to a temp file first, then read the file (see load_docker_images).
 CURL_RETRY_FLAGS = "--retry 5 --retry-all-errors --retry-delay 1"
 _DOCKER_IMAGE_INSPECT_FORMAT = "{{.Id}}"
+_DOCKER_IMAGE_LOAD_EXEC_RETRIES = 2
 # Docker label on what a step starts on a sandbox's Docker host (containers, images, networks), valued with the
 # sandbox id, so a sandbox that shares its host (the local one) can remove its own when it terminates.
 SANDBOX_LABEL = "agentenv.sandbox"
@@ -308,21 +309,17 @@ class VmSandbox(Sandbox):
                 f"{command} & pid_{idx}=$!" for idx, command in enumerate(load_commands)
             )
             waits = "\n".join(f"wait $pid_{idx} || status=1" for idx in range(len(load_commands)))
-            cleanup_command = "rm -f " + " ".join(shlex.quote(path) for path in staging_paths)
             script = (
-                f"trap {shlex.quote(cleanup_command)} EXIT\n"
                 "set -o pipefail\n"
                 f"{workers}\n"
                 "status=0\n"
                 f"{waits}\n"
                 "exit $status"
             )
-            await self.exec_script(script)
-        except BaseException:
-            # Download failures happen before the shell trap can be installed.
-            with contextlib.suppress(Exception):
-                await self._remove_vm_temp_file(*staging_paths)
-            raise
+            # Signed archives are downloaded per attempt; keep unsigned archives staged until retries finish.
+            await self.exec_script(script, max_retries=_DOCKER_IMAGE_LOAD_EXEC_RETRIES)
+        finally:
+            await self._remove_vm_temp_file(*staging_paths)
 
         logger.info("Verifying Docker images...")
         image_refs = [artifact.image_name for artifact in artifacts]
@@ -402,18 +399,19 @@ class VmSandbox(Sandbox):
 
     async def _write_bytes_to_vm_path(self, data: bytes, vm_path: str) -> None:
         """Stream bytes from agent-env onto the VM host at vm_path (base64 over exec)."""
-        import base64
-
         encoded = base64.b64encode(data).decode()
         if len(encoded) <= self._WFT_CHUNK_BYTES:
             await self.exec_script(f"base64 -d <<'ENDB64' > {shlex.quote(vm_path)}\n{encoded}\nENDB64")
             return
         # Too big for one heredoc arg: append the (shell-safe) base64 in bounded chunks.
         vm_b64 = f"{vm_path}.b64"
-        await self.exec_script(f": > {shlex.quote(vm_b64)}")
-        for i in range(0, len(encoded), self._WFT_CHUNK_BYTES):
-            await self.exec_script(f"printf '%s' {shlex.quote(encoded[i:i + self._WFT_CHUNK_BYTES])} >> {shlex.quote(vm_b64)}")
-        await self.exec_script(f"base64 -d {shlex.quote(vm_b64)} > {shlex.quote(vm_path)} && rm -f {shlex.quote(vm_b64)}")
+        try:
+            await self.exec_script(f": > {shlex.quote(vm_b64)}")
+            for i in range(0, len(encoded), self._WFT_CHUNK_BYTES):
+                await self.exec_script(f"printf '%s' {shlex.quote(encoded[i:i + self._WFT_CHUNK_BYTES])} >> {shlex.quote(vm_b64)}")
+            await self.exec_script(f"base64 -d {shlex.quote(vm_b64)} > {shlex.quote(vm_path)}")
+        finally:
+            await self._remove_vm_temp_file(vm_b64)
 
     async def write_host_file(self, data: bytes, vm_path: str) -> None:
         """Write bytes to vm_path on the VM host itself, not into the agent container."""
@@ -428,7 +426,7 @@ class VmSandbox(Sandbox):
             await self._write_bytes_to_vm_path(content.encode(), vm_path)
             await self._copy_into_container(vm_path, destination_path)
         finally:
-            await self._remove_vm_temp_file(vm_path, f"{vm_path}.b64")
+            await self._remove_vm_temp_file(vm_path)
 
 
 def port_bindings(host_ips: Iterable[str], host_port: int, container_port: int) -> list[str]:

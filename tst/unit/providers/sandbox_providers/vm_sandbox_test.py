@@ -82,7 +82,7 @@ async def test_load_docker_images_downloads_to_file_before_load(signing_store):
     assert "gunzip -c" in load_script
     assert "set -o pipefail" in load_script
     assert "wait $pid_0 || status=1" in load_script
-    assert "trap 'rm -f" in load_script
+    assert "trap " not in load_script
 
 
 @pytest.mark.asyncio
@@ -121,13 +121,14 @@ async def test_load_image_worker_failure_propagates_and_cleans_staging(
         SimpleNamespace(tar_gz_object_url=f"s3://bucket/{i}", image_name=f"repo:{i}")
         for i in range(2)
     ]
-    with pytest.raises(RuntimeError, match="load script exited"):
+    with pytest.raises(RuntimeError, match=r"Script failed \(exit 1\)"):
         await sandbox._load_docker_images(images, ["https://signed/a", "https://signed/b"])
     assert sorted(docker_log.read_text().splitlines()) == expected_loads
     assert all(
         not Path(f"/tmp/_docker_image_{sandbox.sandbox_id}_{i}.tar.gz").exists()
         for i in range(2)
     )
+    assert len([script for script in sandbox.scripts if "docker load" in script]) == 1
     assert not any("image" in call and "inspect" in call for call in sandbox.verify_calls)
 
 
@@ -150,6 +151,48 @@ async def test_load_image_success_runs_every_worker_and_verifies_refs(tmp_path):
     )]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signed", [True, False], ids=["signed", "unsigned"])
+async def test_load_image_retries_after_transient_exec_result_without_losing_archive(
+    tmp_path, monkeypatch, signed,
+):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_log = tmp_path / "docker-load.log"
+    _install_docker_load_stubs(bin_dir)
+    sandbox = _ShellVmSandbox(bin_dir, docker_log, f"lifecycle-{tmp_path.name}")
+    sandbox.transient_results = 1
+    artifacts = [
+        SimpleNamespace(tar_gz_object_url=f"s3://bucket/{idx}", image_name=f"repo:{idx}")
+        for idx in range(2)
+    ]
+
+    if not signed:
+        downloaded = []
+
+        async def save_unsigned(_object_url, vm_path):
+            downloaded.append(vm_path)
+            Path(vm_path).write_text("ok")
+
+        sandbox._download_object_to_vm = save_unsigned
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(sandbox_module.asyncio, "sleep", no_sleep)
+    await sandbox._load_docker_images(
+        artifacts,
+        ["https://signed/a", "https://signed/b"] if signed else [None, None],
+    )
+
+    assert sorted(docker_log.read_text().splitlines()) == ["ok"] * 4
+    assert len([script for script in sandbox.scripts if "docker load" in script]) == 2
+    assert not any(Path(path).exists() for path in (
+        f"/tmp/_docker_image_{sandbox.sandbox_id}_{idx}.tar.gz" for idx in range(2)
+    ))
+    if not signed:
+        assert len(downloaded) == 2
+
+
 class _ShellVmSandbox(_RecordingVmSandbox):
     def __init__(self, bin_dir, docker_log, sandbox_id):
         super().__init__()
@@ -157,20 +200,24 @@ class _ShellVmSandbox(_RecordingVmSandbox):
         self.docker_log = docker_log
         self.sandbox_id = sandbox_id
         self.verify_calls = []
-
-    async def exec_script(self, script, *, max_retries=0):
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin_dir}:{os.environ['PATH']}",
-            DOCKER_LOG=str(self.docker_log),
-        )
-        result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(f"load script exited {result.returncode}")
-        self.scripts.append(script)
+        self.transient_results = 0
 
     async def exec_with_output(self, *args):
-        self.verify_calls.append(args)
+        if args[:4] == ("sudo", "docker", "image", "inspect"):
+            self.verify_calls.append(args)
+        if args[:3] == ("sudo", "bash", "-c"):
+            script = args[3]
+            self.scripts.append(script)
+            env = dict(
+                os.environ,
+                PATH=f"{self.bin_dir}:{os.environ['PATH']}",
+                DOCKER_LOG=str(self.docker_log),
+            )
+            result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+            if self.transient_results:
+                self.transient_results -= 1
+                return -1, result.stdout, result.stderr
+            return result.returncode, result.stdout, result.stderr
         return await super().exec_with_output(*args)
 
 
@@ -244,6 +291,57 @@ async def test_unsigned_download_failure_cleans_staging_file(signing_store, tmp_
         await sandbox._load_docker_images([artifact], [None])
     assert cleaned == [f"/tmp/_docker_image_{sandbox.sandbox_id}_0.tar.gz"]
     assert not Path(cleaned[0]).exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_chunk_write_removes_base64_staging_file(tmp_path):
+    sandbox = _ChunkWriteSandbox()
+    destination = tmp_path / "payload.bin"
+    staging = Path(f"{destination}.b64")
+    with pytest.raises(RuntimeError, match=r"Script failed \(exit 17\)"):
+        await sandbox._write_bytes_to_vm_path(b"x" * (VmSandbox._WFT_CHUNK_BYTES + 1), str(destination))
+    assert not staging.exists()
+    assert sandbox.scripts[-1] == f"rm -f {staging}"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_chunk_write_removes_base64_staging_file(tmp_path):
+    sandbox = _ChunkWriteSandbox(cancel_chunk=True)
+    destination = tmp_path / "payload.bin"
+    staging = Path(f"{destination}.b64")
+    write = asyncio.create_task(
+        sandbox._write_bytes_to_vm_path(b"x" * (VmSandbox._WFT_CHUNK_BYTES + 1), str(destination))
+    )
+    await asyncio.wait_for(sandbox.chunk_started.wait(), 1)
+    write.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await write
+    assert not staging.exists()
+    assert sandbox.scripts[-1] == f"rm -f {staging}"
+
+
+class _ChunkWriteSandbox(VmSandbox):
+    def __init__(self, *, cancel_chunk=False):
+        self.scripts = []
+        self.cancel_chunk = cancel_chunk
+        self.chunk_started = asyncio.Event()
+
+    async def terminate(self):  # pragma: no cover
+        pass
+
+    async def exec(self, *command):  # pragma: no cover
+        return None
+
+    async def exec_with_output(self, *args):
+        script = script_run(args)
+        self.scripts.append(script)
+        if script.startswith("printf '%s'"):
+            if self.cancel_chunk:
+                self.chunk_started.set()
+                await asyncio.Future()
+            return 17, "", "chunk write failed"
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        return result.returncode, result.stdout, result.stderr
 
 
 class _ScriptRecorder(VmSandbox):
@@ -536,7 +634,8 @@ async def test_write_host_file_writes_on_the_host_in_bounded_chunks():
     assert not any("docker" in s for s in sandbox.scripts)
     b64_path = "/tmp/agentenv_run_code/input.json.b64"
     assert _b64_from_chunk_scripts(sandbox.scripts, b64_path) == base64.b64encode(data).decode()
-    assert sandbox.scripts[-1] == f"base64 -d {b64_path} > /tmp/agentenv_run_code/input.json && rm -f {b64_path}"
+    assert f"base64 -d {b64_path} > /tmp/agentenv_run_code/input.json" in sandbox.scripts
+    assert sandbox.scripts[-1] == f"rm -f {b64_path}"
 
 
 class _ArgsRecorder(VmSandbox):
