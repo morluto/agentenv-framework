@@ -17,9 +17,10 @@ import statistics
 import subprocess
 import time
 import tracemalloc
+from dataclasses import dataclass
 from types import SimpleNamespace
 
-from agent_env.task.task import Task, _SchedulerState, _ancestor_ids, _dependency_ids
+from agent_env.task.task import Task
 
 
 def _baseline_methods(base_ref: str):
@@ -27,6 +28,13 @@ def _baseline_methods(base_ref: str):
         ["git", "show", f"{base_ref}:src/agent_env/task/task.py"], text=True,
     )
     module = ast.parse(source)
+    dependencies = {"_SchedulerState", "_ancestor_ids", "_dependency_ids"}
+    baseline_dependencies = [
+        node for node in module.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in dependencies
+    ]
+    if {node.name for node in baseline_dependencies} != dependencies:
+        raise RuntimeError(f"{base_ref} does not contain the expected scheduler dependencies")
     task_class = next(
         node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "Task"
     )
@@ -46,13 +54,9 @@ def _baseline_methods(base_ref: str):
         module="__future__", names=[ast.alias(name="annotations")], level=0,
     )
     extracted = ast.fix_missing_locations(
-        ast.Module(body=[future_annotations, baseline_class], type_ignores=[])
+        ast.Module(body=[future_annotations, *baseline_dependencies, baseline_class], type_ignores=[])
     )
-    namespace = {
-        "_SchedulerState": _SchedulerState,
-        "_ancestor_ids": _ancestor_ids,
-        "_dependency_ids": _dependency_ids,
-    }
+    namespace = {"dataclass": dataclass, "__name__": __name__}
     exec(compile(extracted, f"{base_ref}:src/agent_env/task/task.py", "exec"), namespace)
     return namespace["BaselineTask"]
 
@@ -114,7 +118,7 @@ def main() -> None:
         print(_row("implicit validation", base, count, args.repeats))
         print(_row("scheduler graph", base, count, args.repeats))
     print(_row("self-retry validation", base, args.retry_steps, args.repeats))
-    print("Baseline method source: AST-extracted from the selected Git ref; unchanged dependency helpers are shared.")
+    print("Baseline methods, dependency helpers and state class: extracted together from the selected Git ref.")
 
 
 if __name__ == "__main__":
