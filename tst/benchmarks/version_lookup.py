@@ -67,9 +67,14 @@ class CountingDocumentStore(LocalSqliteDocumentStore):
 
 def _baseline_versioned_store() -> tuple[type[VersionedEntityStore], str]:
     """Load the version-store methods directly from the pinned pre-change source."""
-    source = subprocess.check_output(
-        ["git", "show", f"{BASELINE_REVISION}:src/agent_env/store/document_store/document_store.py"], text=True
-    )
+    command = ["git", "show", f"{BASELINE_REVISION}:src/agent_env/store/document_store/document_store.py"]
+    try:
+        source = subprocess.check_output(command, text=True, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            f"Benchmark baseline {BASELINE_REVISION} is unavailable in this checkout. "
+            f"Fetch it with `git fetch origin {BASELINE_REVISION}` and rerun the benchmark."
+        ) from error
     module = ast.parse(source)
     original = next(
         node for node in module.body
