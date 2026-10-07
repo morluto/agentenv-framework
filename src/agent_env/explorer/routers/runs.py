@@ -20,10 +20,12 @@ from agent_env.config import get_config, get_runner
 from agent_env.explorer.entity_ids import EntityId
 from agent_env.explorer.routers.common import PaginatedResponse, docs
 from agent_env.runner.runner import RunStatus
-from agent_env.store import Filter, In, Sort
+from agent_env.store import Filter, Sort
 from agent_env.task.store import TaskStepStatus
 
 logger = logging.getLogger(__name__)
+
+INSTANCE_READ_BATCH_SIZE = 500
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["runs"])
 
@@ -290,14 +292,12 @@ def _instances_for_runs(records: list) -> dict[str, dict]:
     instance_ids = list(dict.fromkeys(record.instance_id for record in records))
     instances: dict[str, dict] = {}
     store = docs()
-    for start in range(0, len(instance_ids), 500):
-        batch = instance_ids[start:start + 500]
-        for instance in store.query(
-            TASK_INSTANCES_COLLECTION, Filter(conditions={"instance_id": [In(batch)]})
-        ):
+    for start in range(0, len(instance_ids), INSTANCE_READ_BATCH_SIZE):
+        batch = instance_ids[start:start + INSTANCE_READ_BATCH_SIZE]
+        for instance in store.find_many_by_id(TASK_INSTANCES_COLLECTION, "instance_id", batch):
             instance_id = instance.get("instance_id")
             if instance_id is not None:
-                instances[instance_id] = instance
+                instances.setdefault(instance_id, instance)
     return instances
 
 

@@ -48,6 +48,63 @@ def test_a_write_that_lands_between_read_and_write_is_not_lost(store_coll):
     assert store.find_one(coll, Filter.of(id="x")) == {"id": "x", "rev": 1}
 
 
+def test_batch_identity_lookup_uses_primary_keys_in_bounded_requests(store_coll, monkeypatch):
+    store, coll = store_coll
+    store.ensure_index(coll, ["instance_id"], unique=True)
+    for i in range(200):
+        store.insert(coll, {"instance_id": f"i{i}"})
+    requests = []
+    original_batch_get = store._client.batch_get_item
+
+    def batch_get(**kwargs):
+        request = kwargs["RequestItems"][store._table_name(coll)]
+        assert request["ConsistentRead"] is True
+        requests.append(len(request["Keys"]))
+        return original_batch_get(**kwargs)
+
+    def refuse_scan(*args, **kwargs):
+        pytest.fail("batch identity reads must not scan")
+
+    monkeypatch.setattr(store._client, "scan", refuse_scan)
+    monkeypatch.setattr(store._client, "get_item", refuse_scan)
+    monkeypatch.setattr(store._client, "batch_get_item", batch_get)
+    ids = [f"i{i}" for i in range(120)]
+    assert store.find_many_by_id(coll, "instance_id", ids + ["missing", "i0"]) == [
+        {"instance_id": identity} for identity in ids
+    ]
+    assert requests == [100, 21]
+
+
+def test_batch_identity_lookup_retries_unprocessed_keys(store_coll, monkeypatch):
+    store, coll = store_coll
+    store.ensure_index(coll, ["instance_id"], unique=True)
+    store.insert(coll, {"instance_id": "i"})
+    original_batch_get = store._client.batch_get_item
+    calls = 0
+
+    def batch_get(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"Responses": {}, "UnprocessedKeys": kwargs["RequestItems"]}
+        return original_batch_get(**kwargs)
+
+    monkeypatch.setattr(store._client, "batch_get_item", batch_get)
+    monkeypatch.setattr(dynamodb_mod.time, "sleep", lambda _: None)
+    assert store.find_many_by_id(coll, "instance_id", ["i"]) == [{"instance_id": "i"}]
+    assert calls == 2
+
+
+def test_batch_identity_lookup_does_not_hide_exhausted_retries(store_coll, monkeypatch):
+    store, coll = store_coll
+    store.ensure_index(coll, ["instance_id"], unique=True)
+    monkeypatch.setattr(dynamodb_mod, "_CAS_ATTEMPTS", 2)
+    monkeypatch.setattr(dynamodb_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(store._client, "batch_get_item", lambda **kwargs: {"UnprocessedKeys": kwargs["RequestItems"]})
+    with pytest.raises(TimeoutError, match="unprocessed keys"):
+        store.find_many_by_id(coll, "instance_id", ["i"])
+
+
 def test_a_write_that_changes_a_unique_index_field_is_refused(store_coll):
     store, coll = store_coll
     store.ensure_index(coll, ["id", "version"], unique=True)

@@ -23,6 +23,7 @@ from agent_env.runner.local_runner import LocalRunner
 from agent_env.runner.runner import RunRecord, RunStatus
 from agent_env.store.object_store.local.store import LocalFilesystemObjectStore
 from agent_env.store.document_store.sqlite_document_store import LocalSqliteDocumentStore
+from agent_env.store.routing import RoutingDocumentStore
 from agent_env.task import Task
 from agent_env.explorer.routers import objects as objects_router
 from agent_env.explorer.routers import triggers as triggers_router
@@ -369,20 +370,20 @@ def test_run_groups_are_not_truncated_at_500(client):
 def test_run_group_list_uses_one_run_snapshot_and_only_page_instances(client, monkeypatch):
     store = get_config().get_document_store()
     query_calls = []
-    original_query = store.query
+    original_query = store.find_many_by_id
     run_pages = []
     original_list_runs = run_store.list_runs
 
-    def counted_query(collection, *args, **kwargs):
+    def counted_query(collection, id_field, ids):
         if collection == "task_instances":
-            query_calls.append(len(args[0].conditions["instance_id"][0].values))
-        return original_query(collection, *args, **kwargs)
+            query_calls.append(len(ids))
+        return original_query(collection, id_field, ids)
 
     def counted_list_runs(*args, **kwargs):
         run_pages.append(kwargs.get("offset", 0))
         return original_list_runs(*args, **kwargs)
 
-    monkeypatch.setattr(store, "query", counted_query)
+    monkeypatch.setattr(store, "find_many_by_id", counted_query)
     monkeypatch.setattr(run_store, "list_runs", counted_list_runs)
     for i in range(1000):
         run_store.insert_run(RunRecord(
@@ -403,18 +404,34 @@ def test_run_group_list_uses_one_run_snapshot_and_only_page_instances(client, mo
     assert run_pages == [0, 500, 1000]
 
 
+def test_run_group_list_preserves_routed_instance_precedence(client, tmp_path):
+    configured = get_config().get_document_store()
+    local = LocalSqliteDocumentStore(str(tmp_path / "local.db"))
+    router = RoutingDocumentStore(configured, local, tmp_path / "local.db")
+    configured.insert("task_instances", {"instance_id": "shared", "current_step": 2, "total_steps": 4})
+    local.insert("task_instances", {"instance_id": "shared", "current_step": 7, "total_steps": 9})
+    run_store.insert_run(RunRecord(
+        run_id="shared-run", runner="local", task_id="t1", task_version=1,
+        instance_id="shared", status=RunStatus.RUNNING, created_at_utc="2026-01-01T00:00:00Z",
+    ))
+    set_document_store(router)
+
+    group = client.get("/api/v1/tasks/t1/run-groups").json()["items"][0]
+    assert (group["instances"][0]["current_step"], group["instances"][0]["total_steps"]) == (2, 4)
+
+
 def test_run_group_list_batches_a_selected_group_larger_than_500(client, monkeypatch):
     gid = "rg-list-big"
     store = get_config().get_document_store()
     query_calls = []
-    original_query = store.query
+    original_query = store.find_many_by_id
 
-    def counted_query(collection, *args, **kwargs):
+    def counted_query(collection, id_field, ids):
         if collection == "task_instances":
-            query_calls.append(len(args[0].conditions["instance_id"][0].values))
-        return original_query(collection, *args, **kwargs)
+            query_calls.append(len(ids))
+        return original_query(collection, id_field, ids)
 
-    monkeypatch.setattr(store, "query", counted_query)
+    monkeypatch.setattr(store, "find_many_by_id", counted_query)
     for i in range(600):
         run_store.insert_run(RunRecord(
             run_id=f"list-big-{i}", runner="local", task_id="t1", task_version=1,

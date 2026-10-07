@@ -211,6 +211,28 @@ def test_other_filters_scan(filter, store_coll):
     assert _plans(store, lambda: store.query(coll, filter)) == ["SCAN docs_coll"]
 
 
+def test_batch_identity_lookup_searches_the_index_and_decodes_only_requested_rows(store_coll, monkeypatch):
+    store, coll = store_coll
+    store.ensure_index(coll, ["instance_id"], unique=True)
+    for i in range(1000):
+        store.insert(coll, {"instance_id": f"i{i}"})
+
+    decoded = []
+    original_loads = sqlite_document_store.json.loads
+
+    def counted_loads(blob, *args, **kwargs):
+        decoded.append(blob)
+        return original_loads(blob, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite_document_store.json, "loads", counted_loads)
+    plans = _plans(store, lambda: store.find_many_by_id(coll, "instance_id", ["i500", "i2", "missing"]))
+    assert any("USING INDEX docs_coll_instance_id_unique" in plan for plan in plans)
+    assert len(decoded) == 2
+    assert store.find_many_by_id(coll, "instance_id", ["i500", "i2", "missing"]) == [
+        {"instance_id": "i500"}, {"instance_id": "i2"},
+    ]
+
+
 @pytest.mark.parametrize("same_store", [False, True], ids=["another connection", "the same store"])
 def test_a_reader_searches_an_index_created_after_its_first_read(tmp_path, same_store):
     path = str(tmp_path / "shared.db")

@@ -245,6 +245,13 @@ class DocumentStore(ABC):
     def count(self, collection: str, filter: Filter) -> int:
         """Return the number of matching documents."""
 
+    def find_many_by_id(self, collection: str, id_field: str, ids: list[str]) -> list[dict]:
+        """First document for each distinct top-level string identity, in requested order; missing IDs are omitted."""
+        return [
+            doc for identity in dict.fromkeys(ids)
+            if (doc := self.find_one(collection, Filter.of(**{id_field: identity}))) is not None
+        ]
+
     def latest_per_id(
         self,
         collection: str,

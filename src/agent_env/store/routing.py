@@ -254,6 +254,28 @@ class RoutingDocumentStore(DocumentStore):
         ]
         return _merge_sort(found, sort)[0] if found else None
 
+    def find_many_by_id(self, collection: str, id_field: str, ids: list[str]) -> list[dict]:
+        identities = list(dict.fromkeys(ids))
+        readers_by_id = {
+            identity: self._readers(collection, Filter.of(**{id_field: identity}))
+            for identity in identities
+        }
+        batches: dict[int, tuple[DocumentStore, list[str]]] = {}
+        for identity, readers in readers_by_id.items():
+            for store in readers:
+                _, batch = batches.setdefault(id(store), (store, []))
+                batch.append(identity)
+        found = {}
+        for store, batch in batches.values():
+            found[id(store)] = {
+                doc[id_field]: doc
+                for doc in self._read(store, lambda: store.find_many_by_id(collection, id_field, batch))
+            }
+        return [
+            doc for identity, readers in readers_by_id.items()
+            if (doc := next((found[id(store)][identity] for store in readers if identity in found[id(store)]), None)) is not None
+        ]
+
     def query(
         self,
         collection: str,

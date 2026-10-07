@@ -50,6 +50,7 @@ _PATH_RE = re.compile(r"[A-Za-z0-9_.]+")
 
 _BUSY_TIMEOUT_SECONDS = 5.0
 _WAL_SWITCH_RETRY_DELAY_SECONDS = 0.01
+_ID_LOOKUP_BATCH_SIZE = 500
 
 
 def _enable_wal(conn: sqlite3.Connection) -> None:
@@ -132,6 +133,28 @@ class LocalSqliteDocumentStore(DocumentStore):
             if limit:
                 docs = docs[:limit]
             return docs
+
+    def find_many_by_id(self, collection: str, id_field: str, ids: list[str]) -> list[dict]:
+        identities = list(dict.fromkeys(ids))
+        if not identities:
+            return []
+        with self._lock:
+            tbl = self._table(collection)
+            if tbl not in self._tables and not self._adopt_if_created(tbl):
+                return []
+            field = self._safe_path(id_field)
+            found = {}
+            for start in range(0, len(identities), _ID_LOOKUP_BATCH_SIZE):
+                batch = identities[start:start + _ID_LOOKUP_BATCH_SIZE]
+                placeholders = ", ".join(["?"] * len(batch))
+                rows = self._conn.execute(
+                    # nosemgrep: sqlalchemy-execute-raw-query -- identifiers are validated; values are bound
+                    f'SELECT rowid, doc FROM "{tbl}" WHERE {_field_expr(field)} IN ({placeholders}) ORDER BY rowid', batch,
+                )
+                for _, blob in rows:
+                    doc = json.loads(blob)
+                    found.setdefault(doc[id_field], doc)
+            return [found[identity] for identity in identities if identity in found]
 
     def count(self, collection: str, filter: Filter) -> int:
         with self._lock:

@@ -41,6 +41,7 @@ def _worker() -> None:
         store = LocalSqliteDocumentStore(str(root / "documents.db"))
         configure(document_store=store)
         run_store.ensure_indexes()
+        store.ensure_index("task_instances", ["instance_id"], unique=True)
         for i in range(1000):
             group = i // 10
             run_store.insert_run(RunRecord(
@@ -63,7 +64,7 @@ def _worker() -> None:
             prefix="/bench", tag="bench", collection="bench_entities", noun="entity",
         ).routes[0].endpoint
 
-        counts = {"query": 0, "find_one": 0}
+        counts = {"query": 0, "find_one": 0, "id_lookup": 0}
         original_query, original_find_one = store.query, store.find_one
 
         def counted_query(*args, **kwargs):
@@ -75,11 +76,19 @@ def _worker() -> None:
             return original_find_one(*args, **kwargs)
 
         store.query, store.find_one = counted_query, counted_find_one
+        if hasattr(store, "find_many_by_id"):
+            original_lookup = store.find_many_by_id
+
+            def counted_lookup(*args, **kwargs):
+                counts["id_lookup"] += 1
+                return original_lookup(*args, **kwargs)
+
+            store.find_many_by_id = counted_lookup
 
         def measure(endpoint, *args):
-            elapsed, query_counts, find_one_counts, digests = [], [], [], []
+            elapsed, query_counts, find_one_counts, lookup_counts, digests = [], [], [], [], []
             for _ in range(3):
-                counts.update(query=0, find_one=0)
+                counts.update(query=0, find_one=0, id_lookup=0)
                 started = time.perf_counter()
                 result = endpoint(*args)
                 elapsed.append(time.perf_counter() - started)
@@ -87,11 +96,13 @@ def _worker() -> None:
                 digests.append(hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest())
                 query_counts.append(counts["query"])
                 find_one_counts.append(counts["find_one"])
+                lookup_counts.append(counts["id_lookup"])
             assert len(set(digests)) == 1
             return {
                 "median_seconds": statistics.median(elapsed),
                 "query_calls_per_call": statistics.median(query_counts),
                 "find_one_calls_per_call": statistics.median(find_one_counts),
+                "id_lookup_calls_per_call": statistics.median(lookup_counts),
                 "response_sha256": digests[0],
                 "total": result.total,
                 "page_items": len(result.items),

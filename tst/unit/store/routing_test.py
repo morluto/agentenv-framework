@@ -506,6 +506,19 @@ def test_a_raw_entity_write_is_checked_like_a_versioned_one(stores, entity_id, r
     assert not (state_root() / "document_store" / "local.db").exists()
 
 
+def test_batch_instance_lookup_keeps_the_first_routed_copy(stores):
+    router, configured, local = stores
+    configured.ensure_index("task_instances", ["instance_id"], unique=True)
+    local.ensure_index("task_instances", ["instance_id"], unique=True)
+    configured.insert("task_instances", {"instance_id": "shared", "current_step": 2})
+    local.insert("task_instances", {"instance_id": "shared", "current_step": 7})
+
+    for scope in (nullcontext(), run_scope(LOCAL_TASK)):
+        with scope:
+            expected = router.find_one("task_instances", Filter.of(instance_id="shared"))
+            assert router.find_many_by_id("task_instances", "instance_id", ["shared"]) == [expected]
+
+
 def test_an_entity_store_defined_outside_core_is_routed_by_id(stores):
     router, configured, local = stores
     plugin_things = VersionedEntityStore(router, "plugin_things", serialize=dict, deserialize=dict)

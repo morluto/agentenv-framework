@@ -313,6 +313,18 @@ def latest_per_id_sort_offset_limit_apply_after_grouping(store, coll):
     assert store.count_distinct(coll, Filter()) == 3
 
 
+def find_many_by_id_preserves_first_documents_and_request_order(store, coll):
+    store.insert(coll, {"identity": "a", "value": "first"})
+    store.insert(coll, {"identity": "b", "value": "second"})
+    store.insert(coll, {"identity": "a", "value": "later"})
+
+    assert store.find_many_by_id(coll, "identity", ["b", "missing", "a", "b"]) == [
+        store.find_one(coll, Filter.of(identity="b")),
+        store.find_one(coll, Filter.of(identity="a")),
+    ]
+    assert store.find_many_by_id(coll, "identity", []) == []
+
+
 def latest_per_id_page_returns_entity_total_and_window(store, coll):
     for doc in [
         {"eid": "a", "rev": 1, "rank": 99},
@@ -474,6 +486,7 @@ CASES = [
     latest_per_id_reduces_to_newest_version,
     latest_per_id_sort_offset_limit_apply_after_grouping,
     latest_per_id_page_returns_entity_total_and_window,
+    find_many_by_id_preserves_first_documents_and_request_order,
     latest_per_id_orders_absent_last_in_both_directions,
     latest_per_id_skips_docs_without_identity,
     latest_per_id_missing_version_sorts_lowest,
