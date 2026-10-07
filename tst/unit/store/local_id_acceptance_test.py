@@ -213,7 +213,7 @@ def test_validating_an_local_agent_on_a_remote_provider_keeps_its_fixtures_and_t
 
 def test_a_put_validates_an_local_entity_like_any_other(local_stores, monkeypatch):
     image_url = local_stores.get_object_store().put("artifacts/docker_image/srv-img/1/x.tar.gz", b"x")
-    image = DockerImageArtifact.put_tar("srv-img", description="d", image_name="reg/srv:v1", tar_gz_s3_url=image_url)
+    image = DockerImageArtifact.put_tar("srv-img", description="d", image_name="reg/srv:v1", tar_gz_object_url=image_url)
     MCPServerEnv.put(id="srv", docker_image_artifact=image, environment_name="svc")
     _validation_runs_nothing(monkeypatch)
 
@@ -224,18 +224,20 @@ def test_a_put_validates_an_local_entity_like_any_other(local_stores, monkeypatc
     assert [d["id"] for d in _local().query("tasks", Filter())] == ["@local/~/bundle/envs/m__validate-v1"]
 
 
-def test_snapshotting_an_local_env_stops_at_the_local_store_it_cannot_presign_before_the_sandbox_runs_anything(
+def test_snapshotting_an_local_env_copies_its_image_off_the_sandbox_into_the_local_store(
     local_stores, cli_routing, tmp_path, monkeypatch,
 ):
     configured = SigningObjectStore(str(tmp_path / "configured-objects"))
     set_object_store(configured)
     sandbox = reattach_for_snapshot(monkeypatch, LOCAL_ENV, 1, UNIVERSE, 1)
 
-    with pytest.raises(RuntimeError, match="LocalFilesystemObjectStore can't presign uploads"):
-        asyncio.run(EnvSnapshot.create("instance-1"))
+    snapshot = asyncio.run(EnvSnapshot.create("instance-1"))
 
-    assert sandbox.scripts == []
-    assert configured.list("") == [] and get_config().get_object_store_for(LOCAL_ENV).list("") == []
+    local = get_config().get_object_store_for(LOCAL_ENV)
+    image = DockerImageArtifact.get(snapshot.db_image_artifact_id, snapshot.db_image_artifact_version)
+    assert local.get(image.tar_gz_object_url) == sandbox.tarball
+    assert configured.list("") == []
+    assert not any("curl" in script for script in sandbox.scripts)
 
 
 @pytest.mark.parametrize("env_id, universe_id", [(LOCAL_ENV, "registry-universe"), ("registry-env", UNIVERSE)],
@@ -283,7 +285,7 @@ def test_a_put_with_an_local_id_builds_and_writes_its_images_under_ids_derived_f
                         lambda dockerfile, context, tag, **kwargs: tags.append(tag))
     tarball = local_stores.get_object_store().put("image.tar.gz", b"x")
     monkeypatch.setattr(DockerImageArtifact, "put", classmethod(lambda cls, id, *, description, image_name, **kwargs: (
-        cls.put_tar(id, description=description, image_name=image_name, tar_gz_s3_url=tarball))))
+        cls.put_tar(id, description=description, image_name=image_name, tar_gz_object_url=tarball))))
     argv = [arg.format(dockerfile=dockerfile) for arg in argv]
     flag = "--frontend-dockerfile" if "--backend-dockerfile" in argv else "--dockerfile"
 
